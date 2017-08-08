@@ -8,7 +8,6 @@ import (
     "crypto/md5"
     "encoding/hex"
 
-//	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/builtin/logical/database/dbplugin"
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/plugins/helper/database/connutil"
@@ -246,16 +245,25 @@ func (p *RedShift) customRevokeUser(username, revocationStmts string) error {
 	return nil
 }
 
-// TODO: It would be nice to provide sensible defaults for RedShift
+const (
+    rs_revoke_sql string = `
+select distinct schemaname from (
+  select QUOTE_IDENT(schemaname) as schemaname FROM pg_tables WHERE schemaname not in ('pg_internal') 
+  union 
+  select QUOTE_IDENT(schemaname) as schemaname FROM pg_views WHERE schemaname not in ('pg_internal') 
+)
+`
+)
+
 func (p *RedShift) defaultRevokeUser(username string) error {
 	db, err := p.getConnection()
 	if err != nil {
 		return err
 	}
 
-	// Check if the role exists
+	// Check if the user exists
 	var exists bool
-	err = db.QueryRow("SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
+	err = db.QueryRow("SELECT exists (SELECT usename FROM pg_user WHERE usename=$1);", username).Scan(&exists)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
@@ -268,7 +276,7 @@ func (p *RedShift) defaultRevokeUser(username string) error {
 	// the role
 	// This isn't done in a transaction because even if we fail along the way,
 	// we want to remove as much access as possible
-	stmt, err := db.Prepare("SELECT DISTINCT table_schema FROM information_schema.role_column_grants WHERE grantee=$1;")
+	stmt, err := db.Prepare("select 'alter table '+schemaname+'.'+tablename+' owner to rdsdb;' as sql from pg_tables where tableowner like $1;")
 	if err != nil {
 		return err
 	}
@@ -283,50 +291,59 @@ func (p *RedShift) defaultRevokeUser(username string) error {
 	const initialNumRevocations = 16
 	revocationStmts := make([]string, 0, initialNumRevocations)
 	for rows.Next() {
-		var schema string
-		err = rows.Scan(&schema)
+		var sql string
+		err = rows.Scan(&sql)
 		if err != nil {
 			// keep going; remove as many permissions as possible right now
 			continue
 		}
-		revocationStmts = append(revocationStmts, fmt.Sprintf(
-			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s;`,
-			pq.QuoteIdentifier(schema),
-			pq.QuoteIdentifier(username)))
-
-		revocationStmts = append(revocationStmts, fmt.Sprintf(
-			`REVOKE USAGE ON SCHEMA %s FROM %s;`,
-			pq.QuoteIdentifier(schema),
-			pq.QuoteIdentifier(username)))
+		revocationStmts = append(revocationStmts, sql)
 	}
-
-	// for good measure, revoke all privileges and usage on schema public
-	revocationStmts = append(revocationStmts, fmt.Sprintf(
-		`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %s;`,
-		pq.QuoteIdentifier(username)))
-
-	revocationStmts = append(revocationStmts, fmt.Sprintf(
-		"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %s;",
-		pq.QuoteIdentifier(username)))
-
-	revocationStmts = append(revocationStmts, fmt.Sprintf(
-		"REVOKE USAGE ON SCHEMA public FROM %s;",
-		pq.QuoteIdentifier(username)))
-
-	// get the current database name so we can issue a REVOKE CONNECT for
-	// this username
-	var dbname sql.NullString
-	if err := db.QueryRow("SELECT current_database();").Scan(&dbname); err != nil {
+	
+	stmt, err = db.Prepare(fmt.Sprintf(`select 'revoke all on schema '+schemaname+' from %s;' as sql from (%s);`,
+									   username,
+									   rs_revoke_sql))
+	if err != nil {
 		return err
 	}
 
-	if dbname.Valid {
-		revocationStmts = append(revocationStmts, fmt.Sprintf(
-			`REVOKE CONNECT ON DATABASE %s FROM %s;`,
-			pq.QuoteIdentifier(dbname.String),
-			pq.QuoteIdentifier(username)))
+	rows, err = stmt.Query()
+	if err != nil {
+		return err
 	}
 
+	for rows.Next() {
+		var sql string
+		err = rows.Scan(&sql)
+		if err != nil {
+			// keep going; remove as many permissions as possible right now
+			continue
+		}
+		revocationStmts = append(revocationStmts, sql)
+	}
+
+	stmt, err = db.Prepare(fmt.Sprintf(`select 'revoke all on all tables in schema '+schemaname+' from %s;' as sql from (%s);`,
+									   username,
+									   rs_revoke_sql))
+	if err != nil {
+		return err
+	}
+
+	rows, err = stmt.Query()
+	if err != nil {
+		return err
+	}
+
+	for rows.Next() {
+		var sql string
+		err = rows.Scan(&sql)
+		if err != nil {
+			// keep going; remove as many permissions as possible right now
+			continue
+		}
+		revocationStmts = append(revocationStmts, sql)
+	}
+	
 	// again, here, we do not stop on error, as we want to remove as
 	// many permissions as possible right now
 	var lastStmtError error
@@ -353,7 +370,7 @@ func (p *RedShift) defaultRevokeUser(username string) error {
 
 	// Drop this user
 	stmt, err = db.Prepare(fmt.Sprintf(
-		`DROP ROLE IF EXISTS %s;`, pq.QuoteIdentifier(username)))
+		`DROP USER %s;`, pq.QuoteIdentifier(username)))
 	if err != nil {
 		return err
 	}
