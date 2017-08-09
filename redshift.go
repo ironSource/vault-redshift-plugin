@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/vault/plugins/helper/database/credsutil"
 	"github.com/hashicorp/vault/plugins/helper/database/dbutil"
 	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
 const (
@@ -76,6 +77,7 @@ func (p *RedShift) CreateUser(statements dbplugin.Statements, usernameConfig dbp
 	}
     
     username = strings.ToLower(username)
+	username = strings.Replace(username, "-", "_", -1)
 
 	password, err = p.GeneratePassword()
 	if err != nil {
